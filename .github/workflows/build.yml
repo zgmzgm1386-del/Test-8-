@@ -1,0 +1,77 @@
+name: Build APK v1.1
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Unzip project
+        shell: bash
+        run: |
+          set -e
+          ls -la
+          mkdir -p project
+          unzip -o panels-manager-fixed.zip -d project
+          ls -la project
+          if [ -f project/ci/run.sh ]; then
+            echo "FOUND=project" >> "$GITHUB_ENV"
+          elif [ -f project/panels-manager/ci/run.sh ]; then
+            echo "FOUND=project/panels-manager" >> "$GITHUB_ENV"
+          else
+            echo "ci/run.sh not found inside zip"
+            find project -type f | head -50
+            exit 1
+          fi
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -e
+          cd "$FOUND"
+          bash ci/run.sh
+
+      - name: Copy APK
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+          APK_FILE=$(find "$FOUND" -name "*.apk" -path "*/dist/*" | head -1)
+          if [ -z "$APK_FILE" ]; then
+            echo "No APK found"
+            find "$FOUND" -name "*.apk" || true
+            exit 1
+          fi
+          cp "$APK_FILE" dist/panels-manager-v1.1.apk
+          ls -lh dist
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: panels-manager-v1.1
+          path: dist/panels-manager-v1.1.apk
+          if-no-files-found: error
