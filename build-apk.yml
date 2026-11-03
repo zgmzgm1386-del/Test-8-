@@ -1,0 +1,82 @@
+name: Build Custom APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone official v2rayNG (tag 2.3.15)
+        run: git clone --depth 1 --branch 2.3.15 https://github.com/2dust/v2rayNG.git upstream
+
+      - name: Apply custom overlay
+        run: unzip -o custom-overlay.zip -d upstream
+
+      - name: Clone hev-socks5-tunnel (pinned commit + submodules)
+        run: |
+          git clone https://github.com/heiher/hev-socks5-tunnel.git upstream/hev-socks5-tunnel
+          git -C upstream/hev-socks5-tunnel checkout c5584feca8f6df70ee53eb2879e034b849a3d15a
+          git -C upstream/hev-socks5-tunnel submodule update --init --recursive
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+      - name: Install NDK 30
+        run: |
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;30.0.16248370" > /dev/null
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+
+      - name: Build native libhevtun (4 ABIs)
+        run: |
+          cd upstream
+          bash compile-hevtun.sh
+          cp -r libs V2rayNG/app/
+
+      - name: Download official libv2ray.aar (v26.10.31)
+        run: |
+          mkdir -p upstream/V2rayNG/app/libs
+          curl -fSL --retry 3 -o upstream/V2rayNG/app/libs/libv2ray.aar \
+            "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.10.31/libv2ray.aar"
+
+      - name: Build debug APKs (fdroid + playstore)
+        run: |
+          cd upstream/V2rayNG
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          chmod 755 gradlew
+          ./gradlew :app:assembleFdroidDebug :app:assemblePlaystoreDebug
+
+      - name: Upload universal APK (playstore)
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayNG-custom-universal-debug
+          path: upstream/V2rayNG/app/build/outputs/apk/playstore/debug/*universal*.apk
+
+      - name: Upload arm64-v8a APK (playstore)
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayNG-custom-arm64-debug
+          path: upstream/V2rayNG/app/build/outputs/apk/playstore/debug/*arm64-v8a.apk
+
+      - name: Upload all debug APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayNG-custom-all-debug
+          path: upstream/V2rayNG/app/build/outputs/apk/*/debug/*.apk
