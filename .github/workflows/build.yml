@@ -45,14 +45,17 @@ jobs:
         id: proj
         run: |
           set -e
-          DIR=$(find extracted "$GITHUB_WORKSPACE" -type f -name gradlew 2>/dev/null | grep -v "/\.git/" | head -1 | xargs -r dirname)
-          if [ -z "$DIR" ]; then
-            echo "ERROR: gradlew not found"; find . -maxdepth 5 -type d | head -60; exit 1
+          # Always resolve to absolute path
+          FOUND=$(find "$GITHUB_WORKSPACE/extracted" "$GITHUB_WORKSPACE" -type f -name gradlew 2>/dev/null | grep -v "/\.git/" | head -1 || true)
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: gradlew not found"
+            find "$GITHUB_WORKSPACE" -maxdepth 6 -type d | head -80
+            exit 1
           fi
+          DIR=$(cd "$(dirname "$FOUND")" && pwd)
+          echo "Gradle project: $DIR"
           echo "dir=$DIR" >> $GITHUB_OUTPUT
-          echo "Found: $DIR"
 
-      # Manual Android SDK — avoids obsolete package "tools"
       - name: Setup Android SDK (manual)
         run: |
           set -e
@@ -60,16 +63,12 @@ jobs:
           mkdir -p "$ANDROID_ROOT/cmdline-tools"
           cd /tmp
           curl -fL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          rm -rf /tmp/cmdline-tools
           unzip -q cmdtools.zip
           rm -rf "$ANDROID_ROOT/cmdline-tools/latest"
           mkdir -p "$ANDROID_ROOT/cmdline-tools/latest"
-          # zip contains cmdline-tools/* 
-          mv cmdline-tools/* "$ANDROID_ROOT/cmdline-tools/latest/" || true
-          # sometimes structure is flat
-          if [ ! -f "$ANDROID_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-            mkdir -p "$ANDROID_ROOT/cmdline-tools/latest"
-            cp -r /tmp/cmdline-tools/* "$ANDROID_ROOT/cmdline-tools/latest/" 2>/dev/null || true
-          fi
+          # commandlinetools zip top-level folder is "cmdline-tools"
+          cp -a /tmp/cmdline-tools/. "$ANDROID_ROOT/cmdline-tools/latest/"
           export ANDROID_HOME="$ANDROID_ROOT"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
@@ -78,26 +77,39 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
-          echo "SDK ready at $ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms" || true
+          echo "SDK ready: $ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms"
 
       - name: Ensure libv2ray.aar
         run: |
           set -e
+          # dir is ABSOLUTE from previous step
           LIBS="${{ steps.proj.outputs.dir }}/app/libs"
           mkdir -p "$LIBS"
+          echo "LIBS=$LIBS"
+
           SIZE=$(stat -c%s "$LIBS/libv2ray.aar" 2>/dev/null || echo 0)
           if [ "$SIZE" -lt 1000000 ]; then
+            echo "Downloading libv2ray.aar..."
             curl -fL --retry 5 -o "$LIBS/libv2ray.aar" \
               "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.10.31/libv2ray.aar"
           fi
+
           if [ ! -f "$LIBS/psiphontunnel-2.0.42.aar" ]; then
             curl -fL --retry 3 -o "$LIBS/psiphontunnel-2.0.42.aar" \
               "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-Android-library/master/ca/psiphon/psiphontunnel/2.0.42/psiphontunnel-2.0.42.aar" || true
           fi
+
           ls -lh "$LIBS"
-          cd /tmp && unzip -qo "$LIBS/libv2ray.aar" classes.jar
-          jar tf classes.jar | grep -E "go/Seq.class|libv2ray/Libv2ray" | head
+          test -f "$LIBS/libv2ray.aar"
+          test "$(stat -c%s "$LIBS/libv2ray.aar")" -gt 1000000
+
+          # Verify contents WITHOUT changing cwd dependency on relative paths
+          VERIFY_DIR=$(mktemp -d)
+          unzip -qo "$LIBS/libv2ray.aar" classes.jar -d "$VERIFY_DIR"
+          jar tf "$VERIFY_DIR/classes.jar" | grep -E "go/Seq.class|libv2ray/Libv2ray" | head
+          rm -rf "$VERIFY_DIR"
+          echo "libv2ray.aar OK"
 
       - name: Build Debug APK
         run: |
