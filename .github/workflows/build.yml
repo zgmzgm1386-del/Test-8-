@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,8 +22,8 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install unzip
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq unzip
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq unzip zip
 
       - name: Extract project ZIP (if present)
         run: |
@@ -37,7 +38,7 @@ jobs:
             mkdir -p extracted
             unzip -q -o "$ZIP" -d extracted
           else
-            echo "No ZIP — using checkout"
+            echo "No ZIP — using checkout source"
             ls -la
           fi
 
@@ -45,7 +46,6 @@ jobs:
         id: proj
         run: |
           set -e
-          # Always resolve to absolute path
           FOUND=$(find "$GITHUB_WORKSPACE/extracted" "$GITHUB_WORKSPACE" -type f -name gradlew 2>/dev/null | grep -v "/\.git/" | head -1 || true)
           if [ -z "$FOUND" ]; then
             echo "ERROR: gradlew not found"
@@ -56,7 +56,7 @@ jobs:
           echo "Gradle project: $DIR"
           echo "dir=$DIR" >> $GITHUB_OUTPUT
 
-      - name: Setup Android SDK (manual)
+      - name: Setup Android SDK (manual, no obsolete tools package)
         run: |
           set -e
           ANDROID_ROOT=$HOME/android-sdk
@@ -67,23 +67,22 @@ jobs:
           unzip -q cmdtools.zip
           rm -rf "$ANDROID_ROOT/cmdline-tools/latest"
           mkdir -p "$ANDROID_ROOT/cmdline-tools/latest"
-          # commandlinetools zip top-level folder is "cmdline-tools"
           cp -a /tmp/cmdline-tools/. "$ANDROID_ROOT/cmdline-tools/latest/"
           export ANDROID_HOME="$ANDROID_ROOT"
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
+          # Match compileSdk 37 in app/build.gradle.kts
+          sdkmanager "platform-tools" "platforms;android-37" "platforms;android-35" "build-tools;35.0.0" "build-tools;37.0.0" || \
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
-          echo "SDK ready: $ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms"
+          ls "$ANDROID_HOME/platforms" || true
 
-      - name: Ensure libv2ray.aar
+      - name: Ensure libv2ray.aar + strip Psiphon go.Seq
         run: |
           set -e
-          # dir is ABSOLUTE from previous step
           LIBS="${{ steps.proj.outputs.dir }}/app/libs"
           mkdir -p "$LIBS"
           echo "LIBS=$LIBS"
@@ -100,16 +99,32 @@ jobs:
               "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-Android-library/master/ca/psiphon/psiphontunnel/2.0.42/psiphontunnel-2.0.42.aar" || true
           fi
 
+          # CRITICAL: both AARs ship go.Seq — remove go/* from Psiphon only
+          if [ -f "$LIBS/psiphontunnel-2.0.42.aar" ]; then
+            WORK=$(mktemp -d)
+            (
+              cd "$WORK"
+              unzip -q "$LIBS/psiphontunnel-2.0.42.aar"
+              if [ -f classes.jar ]; then
+                mkdir cj && (cd cj && jar xf ../classes.jar && rm -rf go && jar cf ../classes.jar .)
+                rm -rf cj
+                zip -q -r fixed.aar .
+                cp -f fixed.aar "$LIBS/psiphontunnel-2.0.42.aar"
+                echo "Stripped go.* from Psiphon AAR"
+              fi
+            )
+            rm -rf "$WORK"
+          fi
+
           ls -lh "$LIBS"
           test -f "$LIBS/libv2ray.aar"
           test "$(stat -c%s "$LIBS/libv2ray.aar")" -gt 1000000
 
-          # Verify contents WITHOUT changing cwd dependency on relative paths
-          VERIFY_DIR=$(mktemp -d)
-          unzip -qo "$LIBS/libv2ray.aar" classes.jar -d "$VERIFY_DIR"
-          jar tf "$VERIFY_DIR/classes.jar" | grep -E "go/Seq.class|libv2ray/Libv2ray" | head
-          rm -rf "$VERIFY_DIR"
-          echo "libv2ray.aar OK"
+          VERIFY=$(mktemp -d)
+          unzip -qo "$LIBS/libv2ray.aar" classes.jar -d "$VERIFY"
+          jar tf "$VERIFY/classes.jar" | grep -E "go/Seq.class|libv2ray/Libv2ray" | head
+          rm -rf "$VERIFY"
+          echo "libv2ray OK"
 
       - name: Build Debug APK
         run: |
@@ -117,9 +132,13 @@ jobs:
           cd "${{ steps.proj.outputs.dir }}"
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
-          ./gradlew assembleFdroidDebug --stacktrace 2>&1 | tee build.log
-          echo "Gradle exit: ${PIPESTATUS[0]}"
-          grep -E "^e: |FAILURE:|Unresolved reference" build.log | head -50 || true
+          # Single flavor to reduce time/noise
+          ./gradlew assembleFdroidDebug --stacktrace --no-daemon 2>&1 | tee build.log
+          EC=${PIPESTATUS[0]}
+          echo "Gradle exit: $EC"
+          echo "==== KEY ERRORS ===="
+          grep -E "^e: |FAILURE:|Duplicate class|Unresolved reference|What went wrong" build.log | head -60 || true
+          exit $EC
 
       - name: Upload build log
         if: always()
