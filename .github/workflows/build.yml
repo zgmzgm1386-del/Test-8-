@@ -1,82 +1,331 @@
-name: Build Custom APK
+name: Build APK
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        required: false
+        type: string
   push:
-    branches: [main, master]
+    branches:
+      - master
+      - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+        fetch-depth: '0'
 
-      - name: Clone official v2rayNG (tag 2.3.15)
-        run: git clone --depth 1 --branch 2.3.15 https://github.com/2dust/v2rayNG.git upstream
+    - name: Extract source ZIP (if repo contains only the zip)
+      run: |
+        set -e
+        # حالت ۱: کل سورس‌ها مستقیم آپلود شده‌اند → چیزی لازم نیست.
+        # حالت ۲: فقط فایل ZIP آپلود شده → همین‌جا باز و در ریشهٔ ریپو پهن می‌شود.
+        if [ ! -f V2rayNG/app/build.gradle.kts ]; then
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "::error::No sources and no .zip found in the repo root."
+            exit 1
+          fi
+          echo "Extracting $ZIP ..."
+          rm -rf /tmp/srczip && mkdir -p /tmp/srczip
+          unzip -q "$ZIP" -d /tmp/srczip
+          if [ -d /tmp/srczip/v2rayng-panels ]; then
+            cp -a /tmp/srczip/v2rayng-panels/. .
+          else
+            cp -a /tmp/srczip/. .
+          fi
+          echo "Extracted. Top-level entries:"
+          ls -1 | head -20
+        else
+          echo "Full sources already present — nothing to extract."
+        fi
 
-      - name: Apply custom overlay
-        run: unzip -o custom-overlay.zip -d upstream
+    - name: Ensure engine sources are present
+      run: |
+        set -e
+        # When the repo is uploaded as a plain ZIP (no git metadata), submodules
+        # arrive as ordinary directories — so we check for the actual sources
+        # instead of .git and clone anything that is missing or incomplete.
+        if [ ! -f hev-socks5-tunnel/src/hev-main.c ] \
+           || [ ! -f hev-socks5-tunnel/third-part/yaml/Android.mk ] \
+           || [ ! -f hev-socks5-tunnel/third-part/lwip/Android.mk ] \
+           || [ ! -f hev-socks5-tunnel/third-part/hev-task-system/Android.mk ] \
+           || [ ! -f hev-socks5-tunnel/src/core/include/hev-socks5-server.h ]; then
+          echo "hev-socks5-tunnel sources incomplete — cloning with submodules"
+          rm -rf hev-socks5-tunnel
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/heiher/hev-socks5-tunnel
+        fi
+        if [ ! -f AndroidLibXrayLite/libv2ray_main.go ]; then
+          echo "AndroidLibXrayLite sources missing — cloning"
+          rm -rf AndroidLibXrayLite
+          git clone --depth 1 https://github.com/2dust/AndroidLibXrayLite
+        fi
+        echo "hev-socks5-tunnel files: $(find hev-socks5-tunnel -type f | wc -l)"
+        echo "AndroidLibXrayLite files: $(find AndroidLibXrayLite -type f | wc -l)"
 
-      - name: Clone hev-socks5-tunnel (pinned commit + submodules)
-        run: |
-          git clone https://github.com/heiher/hev-socks5-tunnel.git upstream/hev-socks5-tunnel
-          git -C upstream/hev-socks5-tunnel checkout c5584feca8f6df70ee53eb2879e034b849a3d15a
-          git -C upstream/hev-socks5-tunnel submodule update --init --recursive
+    - name: Free disk space (keep Android SDK)
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghcc /usr/local/.ghcup || true
+        sudo docker image prune --all --force || true
 
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v4
+      with:
+        log-accepted-android-sdk-licenses: false
+        cmdline-tools-version: '14742923'
+        packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+    - name: Install NDK
+      run: |
+        echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          --channel=0 \
+          --install "ndk;30.0.16248370"
+        echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> $GITHUB_ENV
+
+    - name: Restore cached libhevtun
+      id: cache-libhevtun-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ github.workspace }}/libs
+        key: libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('hev-socks5-tunnel/src/**') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+    - name: Build libhevtun
+      if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+      run: |
+        bash compile-hevtun.sh
+
+    - name: Save libhevtun
+      if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/libs
+        key: libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('hev-socks5-tunnel/src/**') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+    - name: Copy libhevtun into the app
+      run: |
+        cp -r ${{ github.workspace }}/libs ${{ github.workspace }}/V2rayNG/app
+
+    # ── Panel engines (Rust): libmhrv_rs.so + libtun2proxy.so + libtorbin.so ──
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android,armv7-linux-androideabi
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk --locked
+
+    - name: Cache Rust builds
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          engines/mhrv-rs
+          engines/torbin
+
+    - name: Build mhrv-rs + tun2proxy (Rust)
+      working-directory: engines/mhrv-rs
+      run: |
+        set -euxo pipefail
+        LIBS=${{ github.workspace }}/V2rayNG/app/libs
+        mkdir -p "$LIBS/arm64-v8a" "$LIBS/armeabi-v7a"
+        cargo ndk -t arm64-v8a -t armeabi-v7a -o "$LIBS" build --release --lib
+        # tun2proxy به‌صورت cdylib جدا ساخته می‌شود (سیمبل‌های JNI آن در همان .so است)
+        cargo ndk -t arm64-v8a -t armeabi-v7a -o "$LIBS" build --release -p tun2proxy
+        ls -la "$LIBS/arm64-v8a"
+
+    - name: Build torbin (Rust, Arti Tor client)
+      working-directory: engines/torbin
+      run: |
+        set -euxo pipefail
+        LIBS=${{ github.workspace }}/V2rayNG/app/libs
+        cargo ndk -t arm64-v8a -t armeabi-v7a build --release
+        cp target/aarch64-linux-android/release/torbin "$LIBS/arm64-v8a/libtorbin.so"
+        cp target/armv7-linux-androideabi/release/torbin "$LIBS/armeabi-v7a/libtorbin.so"
+        chmod +x "$LIBS"/*/libtorbin.so
+
+    # ── Panel engines (Go): libslipnet.so + libshkcore.so (best-effort) ──
+    - name: Setup Go toolchain
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    - name: Build slipnet (Go, from upstream SlipNet)
+      run: |
+        set -euxo pipefail
+        LIBS=${{ github.workspace }}/V2rayNG/app/libs
+        mkdir -p "$LIBS/arm64-v8a" "$LIBS/armeabi-v7a"
+        rm -rf /tmp/slipnet-src
+        git clone --depth 1 https://github.com/anonvector/SlipNet /tmp/slipnet-src
+        cd /tmp/slipnet-src/cli
+        GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$LIBS/arm64-v8a/libslipnet.so" .
+        GOOS=android GOARCH=arm CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$LIBS/armeabi-v7a/libslipnet.so" .
+
+    - name: Build shkcore (Go, Psiphon tunnel-core — best effort)
+      continue-on-error: true
+      run: |
+        set -uxo pipefail
+        LIBS=${{ github.workspace }}/V2rayNG/app/libs
+        if ! git ls-remote https://github.com/Psiphon-Inc/psiphon-tunnel-core HEAD; then
+          echo "psiphon-tunnel-core repository is not publicly reachable; APK ships without libshkcore.so"
+          echo "(the Psiphon tab then shows its built-in 'engine not bundled' message)"
+          exit 0
+        fi
+        rm -rf /tmp/shk-src
+        git clone --depth 1 https://github.com/Psiphon-Inc/psiphon-tunnel-core /tmp/shk-src
+        cd /tmp/shk-src/ConsoleClient
+        GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$LIBS/arm64-v8a/libshkcore.so" .
+        GOOS=android GOARCH=arm CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$LIBS/armeabi-v7a/libshkcore.so" .
+
+    - name: List packaged native engines
+      run: |
+        ls -la V2rayNG/app/libs/arm64-v8a || true
+        ls -la V2rayNG/app/libs/armeabi-v7a || true
+
+    - name: Determine AndroidLibXrayLite tag
+      run: |
+        set -e
+        # Preferred: pinned tag file in this repo (works even without git metadata)
+        if [ -s .androidlibxraylite-tag ]; then
+          CURRENT_TAG=$(tr -d '[:space:]' < .androidlibxraylite-tag)
+        elif [ -d AndroidLibXrayLite/.git ]; then
+          CURRENT_TAG=$(git -C AndroidLibXrayLite describe --tags --abbrev=0)
+        else
+          CURRENT_TAG=$(curl -fsSL https://api.github.com/repos/2dust/AndroidLibXrayLite/releases/latest \
+            | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
+        fi
+        echo "Using AndroidLibXrayLite tag: $CURRENT_TAG"
+        echo "CURRENT_TAG=$CURRENT_TAG" >> $GITHUB_ENV
+
+    - name: Download libv2ray
+      uses: robinraju/release-downloader@v1.13
+      with:
+        repository: '2dust/AndroidLibXrayLite'
+        tag: ${{ env.CURRENT_TAG }}
+        fileName: 'libv2ray.aar'
+        out-file-path: V2rayNG/app/libs/
+
+    - name: Setup Java
+      uses: actions/setup-java@v6.1.0
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    # امضای APK: اگر سیکرت‌های ریپو ست شده باشند از همان‌ها استفاده می‌شود؛
+    # در غیر این صورت یک keystore محلی موقت ساخته می‌شود تا بیلد همیشه سبز بماند.
+    - name: Prepare signing keystore
+      id: keystore
+      env:
+        KS_B64: ${{ secrets.APP_KEYSTORE_BASE64 }}
+        KS_PASS: ${{ secrets.APP_KEYSTORE_PASSWORD }}
+        KS_ALIAS: ${{ secrets.APP_KEYSTORE_ALIAS }}
+        KS_KEY_PASS: ${{ secrets.APP_KEY_PASSWORD }}
+      run: |
+        if [ -n "$KS_B64" ]; then
+          echo "$KS_B64" | base64 -d > /tmp/android_keystore.jks
+          echo "store=/tmp/android_keystore.jks" >> $GITHUB_OUTPUT
+          echo "store_pass=$KS_PASS" >> $GITHUB_OUTPUT
+          echo "alias=$KS_ALIAS" >> $GITHUB_OUTPUT
+          echo "key_pass=$KS_KEY_PASS" >> $GITHUB_OUTPUT
+          echo "Using repo secrets for signing."
+        else
+          keytool -genkeypair -v \
+            -keystore /tmp/android_keystore.jks \
+            -storepass panelsci123 -keypass panelsci123 \
+            -alias panels -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=v2rayng-panels, OU=CI, O=local" >/dev/null
+          echo "store=/tmp/android_keystore.jks" >> $GITHUB_OUTPUT
+          echo "store_pass=panelsci123" >> $GITHUB_OUTPUT
+          echo "alias=panels" >> $GITHUB_OUTPUT
+          echo "key_pass=panelsci123" >> $GITHUB_OUTPUT
+          echo "No keystore secrets found — generated a local CI keystore."
+        fi
+
+    - name: Build APK
+      run: |
+        cd ${{ github.workspace }}/V2rayNG
+        echo "sdk.dir=${ANDROID_HOME}" > local.properties
+        chmod 755 gradlew
+        ./gradlew licenseFdroidReleaseReport
+        ./gradlew assembleRelease \
+          -Pandroid.injected.signing.store.file=${{ steps.keystore.outputs.store }} \
+          -Pandroid.injected.signing.store.password=${{ steps.keystore.outputs.store_pass }} \
+          -Pandroid.injected.signing.key.alias=${{ steps.keystore.outputs.alias }} \
+          -Pandroid.injected.signing.key.password=${{ steps.keystore.outputs.key_pass }}
+
+    - name: Upload arm64-v8a APK
+      uses: actions/upload-artifact@v7
+      if: ${{ success() }}
+      with:
+        name: arm64-v8a
+        path: ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/*/release/*arm64-v8a*.apk
+
+    - name: Upload armeabi-v7a APK
+      uses: actions/upload-artifact@v7
+      if: ${{ success() }}
+      with:
+        name: armeabi-v7a
+        path: ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/*/release/*armeabi-v7a*.apk
+
+    - name: Upload x86 APKs
+      uses: actions/upload-artifact@v7
+      if: ${{ success() }}
+      with:
+        name: x86-apks
+        path: |
+          ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/*/release/*x86*.apk
+
+    - name: Upload universal APK
+      uses: actions/upload-artifact@v7
+      if: ${{ success() }}
+      with:
+        name: universal-apk
+        path: ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/*/release/*universal*.apk
+
+  sign-and-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v8
         with:
-          distribution: temurin
-          java-version: '21'
+          path: release
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
-
-      - name: Install NDK 30
+      - name: Sign APK files
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;30.0.16248370" > /dev/null
-          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "GPG_PRIVATE_KEY secret is not set — skipping GPG signatures."
+            exit 0
+          fi
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          mkdir -p release-files
 
-      - name: Build native libhevtun (4 ABIs)
-        run: |
-          cd upstream
-          bash compile-hevtun.sh
-          cp -r libs V2rayNG/app/
+          find release -type f -name '*.apk' | while read apk; do
+            cp "$apk" release-files/
+            gpg --batch --yes --local-user "$KEY" --detach-sign --output "release-files/$(basename "$apk").sig" "$apk"
+          done
 
-      - name: Download official libv2ray.aar (v26.10.31)
-        run: |
-          mkdir -p upstream/V2rayNG/app/libs
-          curl -fSL --retry 3 -o upstream/V2rayNG/app/libs/libv2ray.aar \
-            "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.10.31/libv2ray.aar"
+          gpg --armor --export "$KEY" > release-files/v2rayN-public-key.asc
 
-      - name: Build debug APKs (fdroid + playstore)
-        run: |
-          cd upstream/V2rayNG
-          echo "sdk.dir=${ANDROID_HOME}" > local.properties
-          chmod 755 gradlew
-          ./gradlew :app:assembleFdroidDebug :app:assemblePlaystoreDebug
-
-      - name: Upload universal APK (playstore)
-        uses: actions/upload-artifact@v4
+      - name: Upload APKs, signatures and public key to release
+        if: ${{ hashFiles('release-files/**') != '' }}
+        uses: svenstaro/upload-release-action@v2
         with:
-          name: v2rayNG-custom-universal-debug
-          path: upstream/V2rayNG/app/build/outputs/apk/playstore/debug/*universal*.apk
-
-      - name: Upload arm64-v8a APK (playstore)
-        uses: actions/upload-artifact@v4
-        with:
-          name: v2rayNG-custom-arm64-debug
-          path: upstream/V2rayNG/app/build/outputs/apk/playstore/debug/*arm64-v8a.apk
-
-      - name: Upload all debug APKs
-        uses: actions/upload-artifact@v4
-        with:
-          name: v2rayNG-custom-all-debug
-          path: upstream/V2rayNG/app/build/outputs/apk/*/debug/*.apk
+          file: release-files/*
+          tag: ${{ inputs.release_tag }}
+          file_glob: true
+          prerelease: true
