@@ -182,7 +182,10 @@ jobs:
         rm -f key_generated.go
         cp ../app/src/main/res/raw/resolvers.txt resolvers.txt
         GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=panels" -o "$LIBS/arm64-v8a/libslipnet.so" .
-        GOOS=android GOARCH=arm CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=panels" -o "$LIBS/armeabi-v7a/libslipnet.so" .
+        # android/arm لینکر داخلی ندارد و لینک خارجی (cgo) با clang خود NDK می‌خواهد — بدون این خطا می‌دهد.
+        GOOS=android GOARCH=arm CGO_ENABLED=1 \
+          CC="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang" \
+          go build -trimpath -ldflags "-s -w -X main.version=panels" -o "$LIBS/armeabi-v7a/libslipnet.so" .
 
     - name: Build shkcore (Go, Psiphon tunnel-core — best effort)
       continue-on-error: true
@@ -198,7 +201,10 @@ jobs:
         git clone --depth 1 https://github.com/Psiphon-Inc/psiphon-tunnel-core /tmp/shk-src
         cd /tmp/shk-src/ConsoleClient
         GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$LIBS/arm64-v8a/libshkcore.so" .
-        GOOS=android GOARCH=arm CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$LIBS/armeabi-v7a/libshkcore.so" .
+        # همان نکتهٔ slipnet: android/arm به لینک خارجی با clang نیازمند است.
+        GOOS=android GOARCH=arm CGO_ENABLED=1 \
+          CC="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang" \
+          go build -trimpath -ldflags "-s -w" -o "$LIBS/armeabi-v7a/libshkcore.so" .
 
     - name: List packaged native engines
       run: |
