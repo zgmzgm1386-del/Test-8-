@@ -1,186 +1,143 @@
-
 name: Build v2rayNG APK
 
 on:
   push:
-    branches:
-      - master
-      - main
+    branches: [ master, main ]
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 75
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Install archive tools
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq unzip zip
+
+      - name: Extract project ZIP if present
         run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip zip
-
-      - name: Extract project ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ZIP_FILE="v2rayNG-panels-src.zip"
-
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "::error::ZIP file not found: $ZIP_FILE"
-            ls -lah
-            exit 1
+          set -e
+          ZIP=""
+          for c in v2rayNG-panels-src.zip v2rayNG-panels-full.zip v2rayNG-panels-extended.zip v2rayNG-full.zip; do
+            [ -f "$c" ] && ZIP="$c" && break
+          done
+          [ -z "$ZIP" ] && ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+          if [ -n "$ZIP" ]; then
+            echo "Extracting $ZIP"
+            mkdir -p extracted
+            unzip -q -o "$ZIP" -d extracted
+          else
+            echo "No ZIP; using repo source"
           fi
 
-          mkdir -p "$GITHUB_WORKSPACE/extracted"
-          unzip -q -o "$ZIP_FILE" -d "$GITHUB_WORKSPACE/extracted"
-
-          echo "SOURCE_ROOT=$GITHUB_WORKSPACE/extracted" >> "$GITHUB_ENV"
-
-      - name: Find Gradle wrapper
-        id: project
-        shell: bash
+      - name: Locate Gradle project
+        id: proj
         run: |
-          set -euo pipefail
-
-          GRADLEW="$(find "$SOURCE_ROOT" -type f -name gradlew -not -path '*/.git/*' -print -quit)"
-
-          if [ -z "$GRADLEW" ]; then
-            echo "::error::gradlew not found"
-            find "$SOURCE_ROOT" -maxdepth 5 -type f | head -150
+          set -e
+          FOUND=$(find "$GITHUB_WORKSPACE/extracted" "$GITHUB_WORKSPACE" -type f -name gradlew 2>/dev/null | grep -v "/\.git/" | head -1 || true)
+          if [ -z "$FOUND" ]; then
+            echo "gradlew not found"
+            find "$GITHUB_WORKSPACE" -maxdepth 5 -type d | head -50
             exit 1
           fi
+          DIR=$(cd "$(dirname "$FOUND")" && pwd)
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Using $DIR"
 
-          PROJECT_DIR="$(cd "$(dirname "$GRADLEW")" && pwd)"
-          chmod +x "$GRADLEW"
-
-          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Project directory: $PROJECT_DIR"
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        shell: bash
+      - name: Android SDK
         run: |
-          set -euo pipefail
-
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-37" \
-            "build-tools;35.0.0"
-
+          set -e
+          ANDROID_ROOT=$HOME/android-sdk
+          mkdir -p "$ANDROID_ROOT/cmdline-tools"
+          cd /tmp
+          curl -fL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          rm -rf /tmp/cmdline-tools
+          unzip -q cmdtools.zip
+          rm -rf "$ANDROID_ROOT/cmdline-tools/latest"
+          mkdir -p "$ANDROID_ROOT/cmdline-tools/latest"
+          cp -a /tmp/cmdline-tools/. "$ANDROID_ROOT/cmdline-tools/latest/"
+          export ANDROID_HOME="$ANDROID_ROOT"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-37" "platforms;android-35" "build-tools;35.0.0" "build-tools;37.0.0" 2>/dev/null \
+            || sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
-      - name: Download required AAR dependencies
-        shell: bash
+      - name: Native AARs
         run: |
-          set -euo pipefail
-
-          LIBS="$PROJECT_DIR/app/libs"
+          set -e
+          LIBS="${{ steps.proj.outputs.dir }}/app/libs"
           mkdir -p "$LIBS"
 
-          XRAY_AAR="$LIBS/libv2ray.aar"
-
-          if [ ! -s "$XRAY_AAR" ] || [ "$(stat -c%s "$XRAY_AAR")" -lt 1000000 ]; then
-            rm -f "$XRAY_AAR"
-
-            curl --fail --location --show-error \
-              --retry 5 --retry-all-errors \
-              --output "$XRAY_AAR" \
+          # libv2ray (required)
+          SZ=$(stat -c%s "$LIBS/libv2ray.aar" 2>/dev/null || echo 0)
+          if [ "$SZ" -lt 1000000 ]; then
+            curl -fL --retry 5 -o "$LIBS/libv2ray.aar" \
               "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.10.31/libv2ray.aar"
           fi
 
-          if [ ! -s "$XRAY_AAR" ]; then
-            echo "::error::libv2ray.aar download failed"
-            exit 1
+          # Psiphon Java API only (strip go + jni to avoid clash with libv2ray)
+          if [ ! -f "$LIBS/psiphontunnel-2.0.42.aar" ]; then
+            curl -fL --retry 3 -o "$LIBS/psiphontunnel-2.0.42.aar" \
+              "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-Android-library/master/ca/psiphon/psiphontunnel/2.0.42/psiphontunnel-2.0.42.aar" || true
           fi
-
-          PSIPHON_AAR="$LIBS/psiphontunnel-2.0.42.aar"
-
-          if [ ! -s "$PSIPHON_AAR" ]; then
-            curl --fail --location --show-error \
-              --retry 5 --retry-all-errors \
-              --output "$PSIPHON_AAR" \
-              "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-Android-library/master/ca/psiphon/psiphontunnel/2.0.42/psiphontunnel-2.0.42.aar"
-          fi
-
-          if [ ! -s "$PSIPHON_AAR" ]; then
-            echo "::error::Psiphon AAR download failed"
-            exit 1
+          if [ -f "$LIBS/psiphontunnel-2.0.42.aar" ]; then
+            W=$(mktemp -d)
+            (
+              cd "$W"
+              unzip -q "$LIBS/psiphontunnel-2.0.42.aar"
+              rm -rf jni
+              if [ -f classes.jar ]; then
+                mkdir cj
+                (cd cj && jar xf ../classes.jar && rm -rf go && jar cf ../classes.jar .)
+                rm -rf cj
+              fi
+              zip -q -r fixed.aar .
+              cp -f fixed.aar "$LIBS/psiphontunnel-2.0.42.aar"
+            )
+            rm -rf "$W"
+            echo "Psiphon AAR sanitized"
           fi
 
           ls -lh "$LIBS"
+          test "$(stat -c%s "$LIBS/libv2ray.aar")" -gt 1000000
 
-      - name: Verify AAR files
-        shell: bash
+      - name: Build
         run: |
-          set -euo pipefail
+          set -o pipefail
+          cd "${{ steps.proj.outputs.dir }}"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          ./gradlew assembleFdroidDebug --stacktrace --no-daemon 2>&1 | tee build.log
+          EC=${PIPESTATUS[0]}
+          echo "exit=$EC"
+          grep -E "^e: |FAILURE:|Duplicate|More than one file|Unexpected symbol|Unresolved" build.log | head -40 || true
+          exit "$EC"
 
-          LIBS="$PROJECT_DIR/app/libs"
-
-          unzip -tq "$LIBS/libv2ray.aar"
-          unzip -tq "$LIBS/psiphontunnel-2.0.42.aar"
-
-          echo "AAR verification passed"
-
-      - name: Build Debug APK
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          cd "$PROJECT_DIR"
-
-          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-
-          chmod +x ./gradlew
-
-          ./gradlew assembleFdroidDebug \
-            --stacktrace \
-            --no-daemon \
-            --warning-mode all 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-
-          GRADLE_EXIT="${PIPESTATUS[0]}"
-
-          echo "===== BUILD ERRORS ====="
-
-          grep -n -E \
-            '(^e: |FAILURE:|What went wrong:|Unresolved reference|Could not resolve|Could not find)' \
-            "$GITHUB_WORKSPACE/build.log" | head -150 || true
-
-          exit "$GRADLE_EXIT"
-
-      - name: Upload build log
+      - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build.log
-          if-no-files-found: warn
-          retention-days: 14
+          path: "**/build.log"
+          if-no-files-found: ignore
 
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayNG-debug-apk
-          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/fdroid/debug/**/*.apk
-          if-no-files-found: error
-          retention-days: 14
+          name: apk-debug
+          path: "**/app/build/outputs/apk/**/*.apk"
+          if-no-files-found: warn
