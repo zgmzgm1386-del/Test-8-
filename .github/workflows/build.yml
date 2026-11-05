@@ -27,12 +27,27 @@ jobs:
         run: |
           set -e
           ZIP=""
-          for c in v2rayNG-panels-src.zip v2rayNG-panels-full.zip v2rayNG-panels-extended.zip v2rayNG-full.zip; do
+          # Pick the MOST RECENTLY COMMITTED zip at repo root, so an old leftover zip
+          # can never shadow a newly uploaded one.
+          if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            ZIP=$(for f in *.zip; do
+                    [ -f "$f" ] || continue
+                    T=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+                    echo "$T $f"
+                  done | sort -rn | head -1 | cut -d' ' -f2-)
+          fi
+          [ -z "$ZIP" ] && for c in v2rayNG-panels-src-v3.zip v2rayNG-panels-src.zip v2rayNG-panels-full.zip v2rayNG-panels-extended.zip v2rayNG-full.zip; do
             [ -f "$c" ] && ZIP="$c" && break
           done
           [ -z "$ZIP" ] && ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
           if [ -n "$ZIP" ]; then
-            echo "Extracting $ZIP"
+            echo "Chosen ZIP: $ZIP ($(stat -c%s "$ZIP") bytes)"
+            unzip -p "$ZIP" v2rayNG-full/VERSION.txt 2>/dev/null || echo "(zip has no VERSION.txt marker)"
+            if unzip -p "$ZIP" "v2rayNG-full/V2rayNG/app/src/main/java/com/v2ray/ang/ui/panels/DisruptionActivity.kt" 2>/dev/null | grep -q "^import android\.content\.Intent$"; then
+              echo "OK: ZIP already contains the DisruptionActivity fix (BUILD-FIX-3)"
+            else
+              echo "::warning::This ZIP is the OLD version. The Patch step will add the missing import automatically."
+            fi
             mkdir -p extracted
             unzip -q -o "$ZIP" -d extracted
           else
@@ -53,6 +68,19 @@ jobs:
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
           echo "Using $DIR"
 
+      - name: Patch known source issue (BUILD-FIX-3, idempotent)
+        run: |
+          set -e
+          DIR="${{ steps.proj.outputs.dir }}"
+          F="$DIR/app/src/main/java/com/v2ray/ang/ui/panels/DisruptionActivity.kt"
+          if [ -f "$F" ] && ! grep -q "^import android\.content\.Intent$" "$F"; then
+            sed -i 's/^import android\.content\.IntentFilter$/import android.content.Intent\nimport android.content.IntentFilter/' "$F"
+            echo "PATCHED: added missing 'import android.content.Intent' to DisruptionActivity.kt"
+            grep -n "import android.content" "$F"
+          else
+            echo "Patch not needed (import already present)"
+          fi
+
       - name: Android SDK
         run: |
           set -e
@@ -67,7 +95,7 @@ jobs:
           cp -a /tmp/cmdline-tools/. "$ANDROID_ROOT/cmdline-tools/latest/"
           export ANDROID_HOME="$ANDROID_ROOT"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
-          yes | sdkmanager --licenses >/dev/null || true
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-37" "platforms;android-35" "build-tools;35.0.0" "build-tools;37.0.0" 2>/dev/null \
             || sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
