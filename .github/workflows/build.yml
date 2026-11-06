@@ -21,8 +21,35 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
-      with:
-        fetch-depth: '0'
+
+    - name: Unzip source (if repo contains the project zip)
+      run: |
+        cd "$GITHUB_WORKSPACE"
+        if [ -f compile-hevtun.sh ] && [ -f V2rayNG/gradlew ]; then
+          echo "Full source detected - skip unzip"
+          exit 0
+        fi
+        ZIPFILE=$(ls *.zip 2>/dev/null | head -1 || true)
+        if [ -z "$ZIPFILE" ]; then
+          echo "::error::No source found: repo root must contain either the full source code or the project .zip file"
+          exit 1
+        fi
+        echo "Extracting $ZIPFILE ..."
+        rm -rf unzip-src && mkdir unzip-src
+        unzip -q -o "$ZIPFILE" -d unzip-src -x '*/.git/*' '.git/*'
+        if [ -f unzip-src/compile-hevtun.sh ]; then
+          SRC=unzip-src
+        elif [ -f unzip-src/Vitory/compile-hevtun.sh ]; then
+          SRC=unzip-src/Vitory
+        else
+          echo "::error::compile-hevtun.sh not found inside $ZIPFILE"
+          ls -la unzip-src
+          exit 1
+        fi
+        cp -a "$SRC"/. .
+        rm -rf unzip-src
+        echo "Workspace root now contains:"
+        ls -a
 
     - name: Setup Android SDK
       uses: android-actions/setup-android@v4
