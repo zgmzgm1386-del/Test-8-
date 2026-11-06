@@ -1,0 +1,113 @@
+name: Build Vitory APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        required: false
+        type: string
+  push:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: '0'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v4
+      with:
+        log-accepted-android-sdk-licenses: false
+        cmdline-tools-version: '14742923'
+        packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+    - name: Install NDK
+      run: |
+        echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          --channel=0 \
+          --install "ndk;30.0.16248370"
+        echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> $GITHUB_ENV
+
+    - name: Build libhevtun
+      run: |
+        bash compile-hevtun.sh
+
+    - name: Copy libhevtun
+      run: |
+        cp -r ${{ github.workspace }}/libs ${{ github.workspace }}/V2rayNG/app
+
+    - name: Download libv2ray
+      uses: robinraju/release-downloader@v1.13
+      with:
+        repository: '2dust/AndroidLibXrayLite'
+        tag: 'v26.10.31'
+        fileName: 'libv2ray.aar'
+        out-file-path: V2rayNG/app/libs/
+
+    - name: Setup Java
+      uses: actions/setup-java@v6.1.0
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    - name: Create signing keystore
+      run: |
+        keytool -genkeypair -v -keystore ${{ github.workspace }}/vitory.jks \
+          -storepass vitory123456 -keypass vitory123456 -alias vitory \
+          -keyalg RSA -keysize 2048 -validity 36500 \
+          -dname "CN=Vitory, OU=Vitory, O=Vitory, L=Tehran, C=IR"
+
+    - name: Build APK
+      run: |
+        cd ${{ github.workspace }}/V2rayNG
+        echo "sdk.dir=${ANDROID_HOME}" > local.properties
+        chmod 755 gradlew
+        ./gradlew assembleRelease \
+          -Pandroid.injected.signing.store.file=${{ github.workspace }}/vitory.jks \
+          -Pandroid.injected.signing.store.password=vitory123456 \
+          -Pandroid.injected.signing.key.alias=vitory \
+          -Pandroid.injected.signing.key.password=vitory123456
+
+    - name: Collect APKs
+      run: |
+        mkdir -p out
+        find V2rayNG/app/build/outputs/apk -name '*arm64-v8a*.apk' -exec cp {} out/ \; || true
+        find V2rayNG/app/build/outputs/apk -name '*armeabi-v7a*.apk' -exec cp {} out/ \; || true
+        find V2rayNG/app/build/outputs/apk -name '*universal*.apk' -exec cp {} out/ \; || true
+        ls -la out
+
+    - name: Upload APKs
+      uses: actions/upload-artifact@v7
+      if: ${{ success() }}
+      with:
+        name: Vitory-APK
+        path: out/*.apk
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+
+      - name: Upload to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          file: release/**/*.apk
+          tag: ${{ inputs.release_tag }}
+          file_glob: true
+          prerelease: true
