@@ -17,12 +17,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # پروژه را هر جای ریپو باشد (ریشه یا داخل زیرپوشه) پیدا می‌کند
+      # اگر پروژه به‌صورت زیپ آپلود شده باشد، خودش بازش می‌کند؛ وگرنه از فایل‌های باز‌شده استفاده می‌کند
+      - name: Unzip project (if uploaded as zip)
+        run: |
+          if [ -z "$(find . -path ./.git -prune -o -type f -path '*/ci/run.sh' -print | head -n1)" ]; then
+            ZIP=$(find . -path ./.git -prune -o -type f -iname '*.zip' -print | head -n1)
+            if [ -n "$ZIP" ]; then
+              echo "unzipping $ZIP"
+              mkdir -p _src && unzip -q -o "$ZIP" -d _src
+            fi
+          fi
+
       - name: Locate project
         run: |
           RUN=$(find . -path ./.git -prune -o -type f -path '*/ci/run.sh' -print | head -n1)
           if [ -z "$RUN" ]; then
-            echo "::error::ci/run.sh پیدا نشد — پوشهٔ ci آپلود نشده. فایل‌های ریپو:"
+            echo "::error::ci/run.sh پیدا نشد (نه باز‌شده، نه داخل زیپ). فایل‌های ریپو:"
             find . -path ./.git -prune -o -maxdepth 2 -print | head -50
             exit 1
           fi
